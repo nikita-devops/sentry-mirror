@@ -18,6 +18,11 @@ pub enum DataCategory {
     /// Transactions / tracing
     #[serde(alias = "tracing")]
     Transactions,
+    /// Release health sessions
+    Sessions,
+    /// Client reports (outcomes)
+    #[serde(rename = "client_report")]
+    ClientReports,
     /// Session replays
     Replays,
     /// Metrics buckets
@@ -26,6 +31,10 @@ pub enum DataCategory {
     Profiling,
     /// Native crash reports
     Minidumps,
+    /// Cron monitor check-ins (envelope item type `check_in`)
+    #[serde(rename = "check_in")]
+    #[serde(alias = "checkin", alias = "check-in")]
+    CheckIn,
 }
 
 /// Outbound destination configuration which may include filtering by data categories.
@@ -145,7 +154,16 @@ pub fn from_args(args: &Args) -> Result<ConfigData, Box<figment::Error>> {
 
     if args.verbose {
         config.verbose = true;
+    }
+
+    // Treat verbose as "show debug logs" regardless of where it was set (YAML/ENV/CLI).
+    if config.verbose {
         config.log_filter = "debug".into();
+    }
+
+    // Guard against empty log filters from env/config.
+    if config.log_filter.trim().is_empty() {
+        config.log_filter = if config.verbose { "debug" } else { "info" }.into();
     }
 
     Ok(config)

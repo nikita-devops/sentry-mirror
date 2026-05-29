@@ -66,9 +66,11 @@ pub fn init(log_config: LoggingConfig) {
         std::mem::forget(guard)
     }
 
+    // Write logs to stdout (plays nicer with Docker/k8s log collectors) and disable ANSI colors.
     let subscriber = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_target(true);
+        .with_writer(std::io::stdout)
+        .with_target(true)
+        .with_ansi(false);
 
     let formatter = match log_config.log_format {
         LogFormat::Json => subscriber

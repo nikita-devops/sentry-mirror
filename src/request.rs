@@ -137,11 +137,47 @@ pub async fn read_and_decode_body<B: Body>(
     config: &ConfigData,
     request: Request<B>,
     headers: &HeaderMap,
-    public_key: &str,
+    public_key: Option<&str>,
 ) -> Result<Bytes, String>
 where
     B::Error: std::error::Error + Sync + Send + 'static,
 {
+    fn format_body_for_log(body_bytes: &Bytes, label: &str) -> String {
+        // Keep verbose logs useful even for binary payloads, but avoid unbounded output.
+        const MAX_LOG_BODY_BYTES: usize = 16 * 1024;
+        let truncated = body_bytes.len() > MAX_LOG_BODY_BYTES;
+        let slice_len = body_bytes.len().min(MAX_LOG_BODY_BYTES);
+        let body_slice = &body_bytes[..slice_len];
+
+        match str::from_utf8(body_slice) {
+            Ok(body_str) => {
+                if truncated {
+                    format!("{label} (utf8, truncated; len={}): {body_str}", body_bytes.len())
+                } else {
+                    format!("{label} (utf8; len={}): {body_str}", body_bytes.len())
+                }
+            }
+            Err(_) => {
+                // Render as hex so logs still contain the exact bytes.
+                let mut hex = String::with_capacity(body_slice.len() * 2 + 2);
+                hex.push_str("0x");
+                for &b in body_slice {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut hex, "{:02x}", b);
+                }
+
+                if truncated {
+                    format!(
+                        "{label} (binary hex, truncated; len={}): {hex}",
+                        body_bytes.len()
+                    )
+                } else {
+                    format!("{label} (binary hex; len={}): {hex}", body_bytes.len())
+                }
+            }
+        }
+    }
+
     let body_read_timer = Instant::now();
     let body_res = request.collect().await;
     if let Err(err) = body_res {
@@ -150,14 +186,18 @@ where
     }
     let mut body_bytes = body_res.unwrap().to_bytes();
 
-    metrics::histogram!("handle_proxy.body_read.duration", "inbound_key" => public_key.to_owned())
-        .record(body_read_timer.elapsed());
-    metrics::histogram!("handle_proxy.body_bytes", "inbound_key" => public_key.to_owned())
-        .record(body_bytes.len() as f64);
+    if let Some(public_key) = public_key {
+        metrics::histogram!("handle_proxy.body_read.duration", "inbound_key" => public_key.to_owned())
+            .record(body_read_timer.elapsed());
+        metrics::histogram!("handle_proxy.body_bytes", "inbound_key" => public_key.to_owned())
+            .record(body_bytes.len() as f64);
+    } else {
+        metrics::histogram!("handle_proxy.body_read.duration").record(body_read_timer.elapsed());
+        metrics::histogram!("handle_proxy.body_bytes").record(body_bytes.len() as f64);
+    }
 
     if config.verbose {
-        let body_str = str::from_utf8(&body_bytes).unwrap_or("<binary data>");
-        debug!("Request Body: {}", body_str);
+        debug!("{}", format_body_for_log(&body_bytes, "Raw Request Body"));
     }
 
     // Bodies can be compressed. If relay is configured to be more permissive
@@ -172,16 +212,24 @@ where
                 decompressed
             }
             Err(e) => {
-                metrics::counter!(
-                    "handle_proxy.decode_error",
-                    "inbound_key" => public_key.to_owned(),
-                )
-                .increment(1);
+                if let Some(public_key) = public_key {
+                    metrics::counter!(
+                        "handle_proxy.decode_error",
+                        "inbound_key" => public_key.to_owned(),
+                    )
+                    .increment(1);
+                } else {
+                    metrics::counter!("handle_proxy.decode_error").increment(1);
+                }
                 warn!("Could not decode request body: {0:?}", e);
 
                 return Err("could not decode request body".to_string());
             }
         }
+    }
+
+    if config.verbose && config.modify_envelope_header && headers.contains_key("content-encoding") {
+        debug!("{}", format_body_for_log(&body_bytes, "Decoded Request Body"));
     }
 
     Ok(body_bytes)
@@ -263,6 +311,10 @@ pub fn detect_data_category(uri: &Uri, body: &Bytes) -> Option<DataCategory> {
     if path.contains("/integration/oltp/v1/traces") || path.ends_with("/traces/") {
         return Some(DataCategory::Transactions);
     }
+    // Cron monitor check-in HTTP endpoint
+    if path.contains("/cron/") {
+        return Some(DataCategory::CheckIn);
+    }
     // Envelope: inspect first item header for type
     if path.contains("/envelope") {
         // Envelope is newline separated lines:
@@ -281,11 +333,14 @@ pub fn detect_data_category(uri: &Uri, body: &Bytes) -> Option<DataCategory> {
                         let mapped = match ty.as_str() {
                             "event" => Some(DataCategory::Errors),
                             "transaction" => Some(DataCategory::Transactions),
+                            "sessions" => Some(DataCategory::Sessions),
+                            "client_report" => Some(DataCategory::ClientReports),
                             "replay_event" => Some(DataCategory::Replays),
                             "metric_buckets" => Some(DataCategory::Metrics),
                             "profile" => Some(DataCategory::Profiling),
                             // minidump usually is separate endpoint, but keep for completeness
                             "minidump" => Some(DataCategory::Minidumps),
+                            "check_in" => Some(DataCategory::CheckIn),
                             _ => None,
                         };
                         if mapped.is_some() {
@@ -365,6 +420,44 @@ mod tests {
         let uri: Uri = "https://o123.ingest.sentry.io/api/1/envelope/".parse().unwrap();
         let cat = detect_data_category(&uri, &body);
         assert!(matches!(cat, Some(DataCategory::Transactions)));
+    }
+
+    #[test]
+    fn test_detect_data_category_from_path_cron() {
+        let uri: Uri = "https://o123.ingest.sentry.io/api/cron/my-monitor/".parse().unwrap();
+        let bytes = Bytes::from_static(b"");
+        let cat = detect_data_category(&uri, &bytes);
+        assert!(matches!(cat, Some(DataCategory::CheckIn)));
+    }
+
+    #[test]
+    fn test_detect_data_category_from_envelope_check_in() {
+        let l1 = r#"{"dsn":"https://deadbeef@ingest.sentry.io/1"}"#;
+        let l2 = r#"{"type":"check_in","length":2}"#;
+        let body = Bytes::from([Bytes::from(l1), Bytes::from("\n"), Bytes::from(l2), Bytes::from("\n"), Bytes::from("{}")].concat());
+        let uri: Uri = "https://o123.ingest.sentry.io/api/1/envelope/".parse().unwrap();
+        let cat = detect_data_category(&uri, &body);
+        assert!(matches!(cat, Some(DataCategory::CheckIn)));
+    }
+
+    #[test]
+    fn test_detect_data_category_from_envelope_sessions() {
+        let l1 = r#"{"dsn":"https://deadbeef@ingest.sentry.io/1"}"#;
+        let l2 = r#"{"type":"sessions","length":2}"#;
+        let body = Bytes::from([Bytes::from(l1), Bytes::from("\n"), Bytes::from(l2), Bytes::from("\n"), Bytes::from("{}")].concat());
+        let uri: Uri = "https://o123.ingest.sentry.io/api/1/envelope/".parse().unwrap();
+        let cat = detect_data_category(&uri, &body);
+        assert!(matches!(cat, Some(DataCategory::Sessions)));
+    }
+
+    #[test]
+    fn test_detect_data_category_from_envelope_client_report() {
+        let l1 = r#"{"dsn":"https://deadbeef@ingest.sentry.io/1"}"#;
+        let l2 = r#"{"type":"client_report","length":2}"#;
+        let body = Bytes::from([Bytes::from(l1), Bytes::from("\n"), Bytes::from(l2), Bytes::from("\n"), Bytes::from("{}")].concat());
+        let uri: Uri = "https://o123.ingest.sentry.io/api/1/envelope/".parse().unwrap();
+        let cat = detect_data_category(&uri, &body);
+        assert!(matches!(cat, Some(DataCategory::ClientReports)));
     }
     #[test]
     fn make_outbound_request_replace_sentry_auth_header() {
@@ -733,7 +826,7 @@ mod tests {
         let request = builder.body(Full::new(bytes)).unwrap();
         let headers = request.headers().clone();
         let public_key = "deadbeef".to_string();
-        let result = read_and_decode_body(&config, request, &headers, &public_key).await;
+        let result = read_and_decode_body(&config, request, &headers, Some(&public_key)).await;
 
         assert!(result.is_ok());
         let new_bytes = result.unwrap();
@@ -759,7 +852,7 @@ mod tests {
         let request = builder.body(Full::new(bytes)).unwrap();
         let headers = request.headers().clone();
         let public_key = "deadbeef".to_string();
-        let result = read_and_decode_body(&config, request, &headers, &public_key).await;
+        let result = read_and_decode_body(&config, request, &headers, Some(&public_key)).await;
 
         assert!(result.is_ok());
         let new_bytes = result.unwrap();

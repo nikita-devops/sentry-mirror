@@ -97,6 +97,11 @@ where
         debug!("Could not find a DSN in the request headers or URI");
         metrics::counter!("handle_proxy.no_dsn").increment(1);
 
+        // Still read & log the body in verbose mode for easier debugging.
+        if state.config.verbose {
+            let _ = request::read_and_decode_body(&state.config, req, &headers, None).await;
+        }
+
         return Ok(bad_request_response());
     }
     // Match the public key with registered keys
@@ -119,11 +124,17 @@ where
         }
     };
 
-    let body_bytes =
-        match request::read_and_decode_body(&state.config, req, &headers, &public_key).await {
-            Ok(body) => body,
-            Err(_) => return Ok(bad_request_response()),
-        };
+    let body_bytes = match request::read_and_decode_body(
+        &state.config,
+        req,
+        &headers,
+        Some(&public_key),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(_) => return Ok(bad_request_response()),
+    };
 
     // Detect data category (best-effort). Fail-open if unknown.
     let detected_category: Option<DataCategory> = request::detect_data_category(&uri, &body_bytes);
