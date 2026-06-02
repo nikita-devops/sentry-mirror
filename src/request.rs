@@ -313,7 +313,7 @@ pub fn detect_data_category(uri: &Uri, body: &Bytes) -> Option<DataCategory> {
     }
     // Cron monitor check-in HTTP endpoint
     if path.contains("/cron/") {
-        return Some(DataCategory::CheckIn);
+        return Some(DataCategory::Monitor);
     }
     // Envelope: inspect first item header for type
     if path.contains("/envelope") {
@@ -340,7 +340,8 @@ pub fn detect_data_category(uri: &Uri, body: &Bytes) -> Option<DataCategory> {
                             "profile" => Some(DataCategory::Profiling),
                             // minidump usually is separate endpoint, but keep for completeness
                             "minidump" => Some(DataCategory::Minidumps),
-                            "check_in" => Some(DataCategory::CheckIn),
+                            "check_in" => Some(DataCategory::Monitor),
+                            "monitor" => Some(DataCategory::Monitor),
                             _ => None,
                         };
                         if mapped.is_some() {
@@ -427,7 +428,7 @@ mod tests {
         let uri: Uri = "https://o123.ingest.sentry.io/api/cron/my-monitor/".parse().unwrap();
         let bytes = Bytes::from_static(b"");
         let cat = detect_data_category(&uri, &bytes);
-        assert!(matches!(cat, Some(DataCategory::CheckIn)));
+        assert!(matches!(cat, Some(DataCategory::Monitor)));
     }
 
     #[test]
@@ -437,7 +438,17 @@ mod tests {
         let body = Bytes::from([Bytes::from(l1), Bytes::from("\n"), Bytes::from(l2), Bytes::from("\n"), Bytes::from("{}")].concat());
         let uri: Uri = "https://o123.ingest.sentry.io/api/1/envelope/".parse().unwrap();
         let cat = detect_data_category(&uri, &body);
-        assert!(matches!(cat, Some(DataCategory::CheckIn)));
+        assert!(matches!(cat, Some(DataCategory::Monitor)));
+    }
+
+    #[test]
+    fn test_detect_data_category_from_envelope_monitor() {
+        let l1 = r#"{"dsn":"https://deadbeef@ingest.sentry.io/1"}"#;
+        let l2 = r#"{"type":"monitor","length":2}"#;
+        let body = Bytes::from([Bytes::from(l1), Bytes::from("\n"), Bytes::from(l2), Bytes::from("\n"), Bytes::from("{}")].concat());
+        let uri: Uri = "https://o123.ingest.sentry.io/api/1/envelope/".parse().unwrap();
+        let cat = detect_data_category(&uri, &body);
+        assert!(matches!(cat, Some(DataCategory::Monitor)));
     }
 
     #[test]

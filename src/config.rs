@@ -31,10 +31,11 @@ pub enum DataCategory {
     Profiling,
     /// Native crash reports
     Minidumps,
-    /// Cron monitor check-ins (envelope item type `check_in`)
-    #[serde(rename = "check_in")]
+    /// Cron monitor check-ins (envelope item types `check_in`, `monitor`)
+    #[serde(rename = "monitor")]
+    #[serde(alias = "check_in")]
     #[serde(alias = "checkin", alias = "check-in")]
-    CheckIn,
+    Monitor,
 }
 
 /// Outbound destination configuration which may include filtering by data categories.

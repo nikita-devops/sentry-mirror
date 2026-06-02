@@ -23,7 +23,7 @@ keys:
       - https://public-key-red@o123.ingest.de.sentry.io/123456
       # Detailed form with per-outbound category filtering:
       - dsn: https://public-key-blue@o456.ingest.us.sentry.io/654321
-        categories: [errors, transactions, replays, metrics, profiling, minidumps, check_in]
+        categories: [errors, transactions, replays, metrics, profiling, minidumps, monitor]
 ```
 
 ## Request rewriting
@@ -48,7 +48,7 @@ sentry-mirror has been tested to work with the following data categories:
 - Metrics
 - Profiling
 - Minidumps
-- Cron monitor check-ins (`check_in`)
+- Cron monitor check-ins (`monitor`)
 
 ## Per-outbound Category Filtering
 
@@ -94,4 +94,4 @@ sentry-mirror will need to be operated behind a load balancer as it cannot termi
 
 ## Versions Drops:
 * 1.0.1 - init 
-* 1.0.7 - added monitor/cron data
+* 1.0.8 - added monitor/cron data
