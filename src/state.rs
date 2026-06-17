@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -34,7 +35,9 @@ impl AppState {
             .enable_http1()
             .enable_http2()
             .build();
-        let client = Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
+        let client = Client::builder(TokioExecutor::new())
+            .pool_idle_timeout(Duration::from_secs(30))
+            .build::<_, Full<Bytes>>(https);
 
         Self {
             config,

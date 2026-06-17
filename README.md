@@ -35,8 +35,11 @@ When events are mirrored to outbound DSNs the following modifications may be mad
 3. `trace.public_key` in envelope headers will be replaced.
 4. Content-Length, Content-Encoding, Host, X-Forwarded-For headers will be removed.
 
-sentry-mirror will send outbound requests concurrently and respond with the response 
-body of the first outbound key.
+Outbound requests are raced: the first successful response is returned to the 
+client immediately while remaining in-flight requests are cancelled.
+Each outbound has a 30-second response timeout, and idle connections 
+are evicted from the pool after 30 seconds — ensuring one slow or 
+stuck outbound does not affect others.
 
 ## Compatible Data Types
 
@@ -95,3 +98,4 @@ sentry-mirror will need to be operated behind a load balancer as it cannot termi
 ## Versions Drops:
 * 1.0.1 - init 
 * 1.0.8 - added monitor/cron data
+* 1.0.9 - outbound independence fix: replaced `join_all` with `FuturesUnordered` + response timeout + pool idle timeout; peer-address logging on connection errors

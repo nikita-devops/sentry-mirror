@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, peer_addr) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let state_loop = state.clone();
 
@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 )
                 .await
             {
-                error!("Error serving connection: {:?}", err);
+                error!("Error serving connection from {peer_addr}: {err:?}");
             }
         });
     }

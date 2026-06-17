@@ -1,7 +1,8 @@
-use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::{Client, ResponseFuture};
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 use tracing::{debug, warn};
 
@@ -56,7 +57,7 @@ pub async fn handle_proxy<B: Body>(
 where
     B::Error: std::error::Error + Sync + Send + 'static,
 {
-    let method = req.method();
+    let method = req.method().clone();
     let uri = req.uri().clone();
     let path = uri.path();
     let headers = req.headers().clone();
@@ -133,7 +134,10 @@ where
     .await
     {
         Ok(body) => body,
-        Err(_) => return Ok(bad_request_response()),
+        Err(e) => {
+            warn!("Could not read/ decode body for {method} {path}: {e}");
+            return Ok(bad_request_response());
+        }
     };
 
     // Detect data category (best-effort). Fail-open if unknown.
@@ -189,37 +193,58 @@ where
             warn!("Could not build request {0:?}", request.err());
         }
     }
-    let mut found_body = false;
+    if responses.is_empty() {
+        warn!("No outbound requests made for {method} {path} (category: {:?})", detected_category);
+    }
+
     let mut resp_body = Bytes::new();
 
-    // Wait for responses to finish and use the first one's body
-    for (resp_future, resp_hostname, request_start) in join_all(responses).await {
-        let response_res = resp_future.await;
-        if let Ok(response) = response_res {
-            debug!("Received response from {}", &resp_hostname);
-            metrics::counter!(
-                "handle_proxy.outbound_request.success",
-                "outbound_host" => resp_hostname.clone(),
-            )
-            .increment(1);
-            metrics::histogram!(
-                "handle_proxy.send_request.duration",
-                "outbound_host" => resp_hostname.clone()
-            )
-            .record(request_start.elapsed());
+    // Race outbound requests: process as they complete, return on first success.
+    // Remaining in-flight futures are dropped when `unordered` goes out of scope.
+    let mut unordered: FuturesUnordered<_> = responses.into_iter().collect();
+    const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(30);
 
-            if found_body {
-                continue;
+    while let Some((resp_future, resp_hostname, request_start)) = unordered.next().await {
+        let response_res = tokio::time::timeout(OUTBOUND_TIMEOUT, resp_future).await;
+        match response_res {
+            Ok(Ok(response)) => {
+                debug!("Received response from {}", &resp_hostname);
+                metrics::counter!(
+                    "handle_proxy.outbound_request.success",
+                    "outbound_host" => resp_hostname.clone(),
+                )
+                .increment(1);
+                metrics::histogram!(
+                    "handle_proxy.send_request.duration",
+                    "outbound_host" => resp_hostname.clone()
+                )
+                .record(request_start.elapsed());
+
+                if !resp_body.is_empty() {
+                    // Drain body to allow connection reuse
+                    tokio::spawn(async move {
+                        let _ = response.collect().await;
+                    });
+                    continue;
+                }
+                if let Ok(response_body) = response.collect().await {
+                    resp_body = response_body.to_bytes();
+                    break;
+                }
             }
-            if let Ok(response_body) = response.collect().await {
-                resp_body = response_body.to_bytes();
-                found_body = true;
+            Ok(Err(e)) => {
+                metrics::counter!("handle_proxy.outbound_request.failed").increment(1);
+                warn!("Could not make request to {resp_hostname}: {e:?}");
             }
-        } else {
-            metrics::counter!("handle_proxy.outbound_request.failed").increment(1);
-            warn!("Could not make request: {0:?}", response_res.err());
+            Err(_) => {
+                metrics::counter!("handle_proxy.outbound_request.failed").increment(1);
+                warn!("Outbound request to {resp_hostname} timed out after 30s");
+            }
         }
     }
+
+    // Remaining in-flight futures are dropped when `unordered` goes out of scope.
+    // Dropping a `ResponseFuture` properly closes the underlying connection.
 
     // Add cors headers necessary for browser events
     let response_builder = Response::builder()
