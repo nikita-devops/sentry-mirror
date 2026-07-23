@@ -1,13 +1,13 @@
 use futures::stream::{FuturesUnordered, StreamExt};
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::{Client, ResponseFuture};
+use hyper_util::client::legacy::{Client, Error as HyperClientError};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::{debug, warn};
 
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Body, Bytes};
+use hyper::body::{Body, Bytes, Incoming};
 use hyper::{Method, StatusCode};
 use hyper::{Request, Response};
 use hyper_rustls::HttpsConnector;
@@ -20,6 +20,16 @@ use crate::config::DataCategory;
 type GenericError = Box<dyn std::error::Error + Send + Sync>;
 type HandlerResult<T> = std::result::Result<T, GenericError>;
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+type HttpsClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+
+/// Max time to wait for a single outbound upstream response.
+const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(30);
+
+type OutboundResult = (
+    Result<Result<Response<Incoming>, HyperClientError>, tokio::time::error::Elapsed>,
+    String,
+    Instant,
+);
 
 pub async fn handle_request<B: Body>(
     req: Request<B>,
@@ -143,8 +153,9 @@ where
     // Detect data category (best-effort). Fail-open if unknown.
     let detected_category: Option<DataCategory> = request::detect_data_category(&uri, &body_bytes);
 
-    // We'll race requests to the outbound DSN's and once all requests are complete
-    // we use the body of the first response
+    // Fan out to all matching outbound DSNs concurrently. Use the first successful
+    // response body for the client, and keep remaining outbounds running in the
+    // background so slower upstreams (e.g. SaaS) are not cancelled.
     let mut responses = Vec::new();
     for outbound_target in keyring.outbound.iter() {
         // Apply per-outbound category filter if configured
@@ -187,7 +198,8 @@ where
         .record(build_request_timer.elapsed());
 
         if let Ok(outbound_request) = request {
-            let fut_res = send_request(&state.client, outbound_request, outbound_host.clone());
+            let fut_res =
+                send_request(state.client.clone(), outbound_request, outbound_host.clone());
             responses.push(fut_res);
         } else {
             warn!("Could not build request {0:?}", request.err());
@@ -198,53 +210,23 @@ where
     }
 
     let mut resp_body = Bytes::new();
-
-    // Race outbound requests: process as they complete, return on first success.
-    // Remaining in-flight futures are dropped when `unordered` goes out of scope.
     let mut unordered: FuturesUnordered<_> = responses.into_iter().collect();
-    const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(30);
 
-    while let Some((resp_future, resp_hostname, request_start)) = unordered.next().await {
-        let response_res = tokio::time::timeout(OUTBOUND_TIMEOUT, resp_future).await;
-        match response_res {
-            Ok(Ok(response)) => {
-                debug!("Received response from {}", &resp_hostname);
-                metrics::counter!(
-                    "handle_proxy.outbound_request.success",
-                    "outbound_host" => resp_hostname.clone(),
-                )
-                .increment(1);
-                metrics::histogram!(
-                    "handle_proxy.send_request.duration",
-                    "outbound_host" => resp_hostname.clone()
-                )
-                .record(request_start.elapsed());
-
-                if !resp_body.is_empty() {
-                    // Drain body to allow connection reuse
+    while let Some(outbound) = unordered.next().await {
+        match settle_outbound(outbound).await {
+            OutboundOutcome::Success { body } => {
+                resp_body = body;
+                // Do not cancel slower outbounds — finish them after returning to the client.
+                if !unordered.is_empty() {
                     tokio::spawn(async move {
-                        let _ = response.collect().await;
+                        finish_remaining_outbounds(unordered).await;
                     });
-                    continue;
                 }
-                if let Ok(response_body) = response.collect().await {
-                    resp_body = response_body.to_bytes();
-                    break;
-                }
+                break;
             }
-            Ok(Err(e)) => {
-                metrics::counter!("handle_proxy.outbound_request.failed").increment(1);
-                warn!("Could not make request to {resp_hostname}: {e:?}");
-            }
-            Err(_) => {
-                metrics::counter!("handle_proxy.outbound_request.failed").increment(1);
-                warn!("Outbound request to {resp_hostname} timed out after 30s");
-            }
+            OutboundOutcome::Failed => {}
         }
     }
-
-    // Remaining in-flight futures are dropped when `unordered` goes out of scope.
-    // Dropping a `ResponseFuture` properly closes the underlying connection.
 
     // Add cors headers necessary for browser events
     let response_builder = Response::builder()
@@ -277,13 +259,72 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
         .boxed()
 }
 
-/// Send a request to its destination async
+enum OutboundOutcome {
+    Success { body: Bytes },
+    Failed,
+}
+
+/// Record metrics/logs for a completed outbound and drain or return its body.
+async fn settle_outbound(outbound: OutboundResult) -> OutboundOutcome {
+    let (response_res, resp_hostname, request_start) = outbound;
+    match response_res {
+        Ok(Ok(response)) => {
+            debug!("Received response from {}", &resp_hostname);
+            metrics::counter!(
+                "handle_proxy.outbound_request.success",
+                "outbound_host" => resp_hostname.clone(),
+            )
+            .increment(1);
+            metrics::histogram!(
+                "handle_proxy.send_request.duration",
+                "outbound_host" => resp_hostname.clone()
+            )
+            .record(request_start.elapsed());
+
+            match response.collect().await {
+                Ok(response_body) => OutboundOutcome::Success {
+                    body: response_body.to_bytes(),
+                },
+                Err(e) => {
+                    metrics::counter!("handle_proxy.outbound_request.failed").increment(1);
+                    warn!("Could not read response body from {resp_hostname}: {e:?}");
+                    OutboundOutcome::Failed
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            metrics::counter!("handle_proxy.outbound_request.failed").increment(1);
+            warn!("Could not make request to {resp_hostname}: {e:?}");
+            OutboundOutcome::Failed
+        }
+        Err(_) => {
+            metrics::counter!("handle_proxy.outbound_request.failed").increment(1);
+            warn!("Outbound request to {resp_hostname} timed out after 30s");
+            OutboundOutcome::Failed
+        }
+    }
+}
+
+/// Drain remaining outbound futures after the client has already been answered.
+async fn finish_remaining_outbounds<F>(mut unordered: FuturesUnordered<F>)
+where
+    F: std::future::Future<Output = OutboundResult> + Send + 'static,
+{
+    while let Some(outbound) = unordered.next().await {
+        // Body is only needed for connection reuse / metrics; discard after settle.
+        let _ = settle_outbound(outbound).await;
+    }
+}
+
+/// Send a request to its destination, waiting up to OUTBOUND_TIMEOUT for headers.
 async fn send_request(
-    client: &Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    client: HttpsClient,
     req: Request<Full<Bytes>>,
     request_host: String,
-) -> (ResponseFuture, String, Instant) {
-    (client.request(req), request_host, Instant::now())
+) -> OutboundResult {
+    let request_start = Instant::now();
+    let response_res = tokio::time::timeout(OUTBOUND_TIMEOUT, client.request(req)).await;
+    (response_res, request_host, request_start)
 }
 
 #[cfg(test)]
